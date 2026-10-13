@@ -1,0 +1,14 @@
+{
+  "size": 256,
+  "initial_epochs": 40,
+  "initial_lr": 0.001,
+  "epochs": 80,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "batch_size": 8,
+  "unroll": 8,
+  "budget": 12,
+  "band_mm": 3,
+  "roi_mm": 16,
+  "loss": {"gate": 1.0, "area": 0.01, "regression": 0.5, "boundary": 0.1}
+}
