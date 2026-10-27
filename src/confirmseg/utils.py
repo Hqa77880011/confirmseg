@@ -56,77 +56,174 @@ def split_groups(rows, key, seed=2027):
 
 
 def plot_results(path, output, metrics=None):
+    """Plot measured summaries, charged-budget curves, spatial rates and paired CIs."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     obj = load(path)
-    rows = obj["summary"] if isinstance(obj, dict) else obj
-    if isinstance(rows, dict):
-        rows = [dict(method=k, **v) for k, v in rows.items()]
+    rows = obj["summary"]
     if not rows:
         raise ValueError("No result rows to plot")
-    rows = [
-        dict(
-            row,
-            **{
-                key + "_" + child: value
-                for key, obj in row.items()
-                if isinstance(obj, dict)
-                for child, value in obj.items()
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
-            },
-        )
-        for row in rows
-    ]
-    metrics = metrics or [
-        k
-        for k, v in rows[0].items()
-        if isinstance(v, (int, float)) and k not in {"seed", "budget"}
-    ]
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    colors = ["#487d96", "#4b8b78", "#6c929a", "#80868b"]
+
+    def finish(fig, name):
+        if obj.get("purpose") == "functional_check":
+            fig.suptitle("Synthetic functional check")
+        fig.tight_layout()
+        fig.savefig(output / (name + ".png"), dpi=180)
+        fig.savefig(output / (name + ".svg"))
+        plt.close(fig)
+
+    def label(row):
+        text = " / ".join(
+            value for value in (row.get("dataset", ""), row["method"]) if value
+        )
+        condition = row.get("condition", {})
+        details = []
+        if condition.get("wrong_approval"):
+            details.append(
+                f"wrong={condition['wrong_approval']:.0%} ({condition.get('wrong_mode', 'event')})"
+            )
+        if condition.get("disable_revocation"):
+            details.append("revocation off")
+        if condition.get("stratum"):
+            details.append(condition["stratum"])
+        if condition.get("replay"):
+            details.append("replay")
+        return text + (" [" + ", ".join(details) + "]" if details else "")
+
+    if obj.get("curves"):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.set_prop_cycle(color=colors)
+        curves = obj["curves"]
+        for name in sorted({label(row) for row in curves}):
+            curve = sorted(
+                (row for row in curves if label(row) == name),
+                key=lambda row: row["budget"],
+            )
+            ax.plot(
+                [row["budget"] for row in curve],
+                [row["dice"] for row in curve],
+                "o-",
+                label=name,
+            )
+        ax.set(xlabel="Charged actions", ylabel="Pooled micro-Dice", ylim=(0, 1))
+        ax.legend(fontsize=8)
+        finish(fig, "pooled_budget_dice")
+
+    if all("budget" in row for row in rows):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.set_prop_cycle(color=colors)
+        for method in sorted({row["method"] for row in rows}):
+            curve = sorted(
+                (row for row in rows if row["method"] == method),
+                key=lambda row: row["budget"],
+            )
+            ax.plot(
+                [row["budget"] for row in curve],
+                [row["dice"] for row in curve],
+                "o-",
+                label=method,
+            )
+        ax.set(xlabel="Charged actions", ylabel="Micro-Dice", ylim=(0, 1))
+        ax.legend(fontsize=8)
+        finish(fig, "budget_dice")
+        return
+
+    aggregate = obj.get("seed_summary")
+    if aggregate:
+        values = []
+        for group in aggregate:
+            record = dict(
+                method=group["method"],
+                dataset=group["dataset"],
+                condition=group["condition"],
+            )
+            for key, value in group["metrics"].items():
+                if isinstance(value, dict) and "mean" in value:
+                    record[key], record[key + "_sd"] = value["mean"], value["sd"]
+            for key, value in group["metrics"].get("patient_macro", {}).items():
+                record["patient_" + key] = value["mean"]
+            values.append(record)
+    else:
+        values = rows
+    metrics = metrics or [
+        "dice",
+        "iou",
+        "actions90",
+        "repeated_corrections",
+        "regression_percent",
+        "target_repair_percent",
+        "changed_editable_percent",
+        "assd_mm",
+        "patient_cost90_alpha_0",
+        "patient_cost90_alpha_10",
+        "patient_cost90_alpha_50",
+    ]
     for metric in metrics:
-        valid = [r for r in rows if isinstance(r.get(metric), (int, float))]
+        valid = [row for row in values if row.get(metric) is not None]
         if not valid:
             continue
-        fig, ax = plt.subplots(figsize=(7, 4))
-        x_key = (
-            "budget"
-            if all("budget" in r for r in valid)
-            else "opportunity_density"
-            if all("opportunity_density" in r for r in valid)
-            else "top_k"
-            if all("top_k" in r for r in valid)
-            else "predicted_gain"
-            if metric == "realized_gain" and all("predicted_gain" in r for r in valid)
-            else None
+        fig, ax = plt.subplots(figsize=(7, max(3, 0.45 * len(valid) + 1)))
+        labels = [label(row) for row in valid]
+        error = [row.get(metric + "_sd") or 0 for row in valid]
+        ax.barh(
+            labels,
+            [row[metric] for row in valid],
+            xerr=error,
+            capsize=3,
+            color="#487d96",
         )
-        if x_key is not None:
-            for method in sorted({r["method"] for r in valid}):
-                subset = sorted(
-                    (r for r in valid if r["method"] == method), key=lambda r: r[x_key]
-                )
-                ax.plot(
-                    [r[x_key] for r in subset],
-                    [r[metric] for r in subset],
-                    "o-",
-                    label=method,
-                )
-            ax.set_xlabel(x_key.replace("_", " ").title())
-            ax.legend(fontsize=8)
-        else:
-            ax.barh(
-                [r.get("method", str(i)) for i, r in enumerate(valid)],
-                [r[metric] for r in valid],
-                color="#487d96",
+        ax.set_xlabel(metric.replace("_", " "))
+        finish(fig, metric)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.set_prop_cycle(color=colors)
+    available = False
+    for row in values:
+        keys = [
+            "regression_" + band + "_percent" for band in ("0_3mm", "3_6mm", "over_6mm")
+        ]
+        if all(row.get(key) is not None for key in keys):
+            ax.errorbar(
+                range(3),
+                [row[key] for key in keys],
+                yerr=[row.get(key + "_sd") or 0 for key in keys],
+                marker="o",
+                capsize=3,
+                label=label(row),
             )
-        ax.set_ylabel(metric)
-        fig.tight_layout()
-        fig.savefig(output / (metric + ".png"), dpi=180)
-        fig.savefig(output / (metric + ".svg"))
+            available = True
+    if available:
+        ax.set(
+            xticks=range(3),
+            xticklabels=["[0,3)", "[3,6)", ">=6"],
+            xlabel="Distance to active approval boundary (mm)",
+            ylabel="Regression (%)",
+        )
+        ax.legend(fontsize=8)
+        finish(fig, "distance_bands")
+    else:
         plt.close(fig)
+    for dataset, paired in obj.get("paired", {}).items():
+        fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
+        for ax, metric, axis_label in zip(
+            axes,
+            ("dice_pp", "repeated_corrections"),
+            ("Dice difference (pp)", "Rework difference"),
+        ):
+            result = paired[metric]
+            low, high = result["patient_interval95"]
+            estimate = result["difference"]
+            ax.plot([low, high], [0, 0], color="#487d96", linewidth=2)
+            ax.plot(estimate, 0, "o", color="#246754")
+            ax.axvline(0, color=".6", linestyle="--", linewidth=0.8)
+            ax.set(xlabel=axis_label, yticks=[], title=dataset)
+        finish(fig, "paired_" + dataset.replace("/", "_"))
 
 
 def peak_memory_mib():

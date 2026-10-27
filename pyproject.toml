@@ -7,7 +7,7 @@ name = "confirmseg"
 version = "0.1.0"
 description = "ConfirmSeg implementation"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.3,<3", "matplotlib>=3.8,<4", "scikit-learn>=1.4,<2", "nibabel>=5.2,<6"]
+dependencies = ["numpy>=1.26,<3", "scipy>=1.11,<2", "torch>=2.3,<3", "matplotlib>=3.8,<4", "nibabel>=5.2,<6"]
 
 [project.scripts]
 confirmseg = "confirmseg.cli:main"
@@ -19,4 +19,4 @@ where = ["src"]
 Repository = "https://github.com/Hqa77880011/confirmseg"
 
 [project.optional-dependencies]
-lidc = ["pylidc==0.2.3", "pydicom>=2.4,<3", "SQLAlchemy>=1.4,<2"]
+lidc = ["pylidc==0.2.3", "pydicom>=2.4,<3", "SQLAlchemy>=1.4,<2", "numpy>=2,<3"]

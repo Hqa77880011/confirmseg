@@ -16,6 +16,8 @@ class Block(nn.Sequential):
 
 
 class Encoder(nn.Module):
+    """Four frozen image scales: full, half, quarter and one-eighth resolution."""
+
     def __init__(self, inputs=1, widths=(32, 64, 128, 256)):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -31,6 +33,8 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
+    """Shared four-block decoder; context is resized onto each encoder scale."""
+
     def __init__(self, context=0):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -78,8 +82,8 @@ class Decoder(nn.Module):
 
 
 def segmentation_loss(probability, target):
-    probability = probability.clamp(1e-6, 1 - 1e-6)
-    bce = F.binary_cross_entropy(probability, target)
+    """Full-grid BCE plus soft Dice, with clamping confined to logarithms."""
+    bce = F.binary_cross_entropy(probability.clamp(1e-6, 1 - 1e-6), target)
     axes = tuple(range(1, target.ndim))
     dice = (2 * (probability * target).sum(axes) + 1e-6) / (
         probability.sum(axes) + target.sum(axes) + 1e-6

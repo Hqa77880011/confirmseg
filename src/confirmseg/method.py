@@ -19,11 +19,35 @@ METHODS = (
     "entropy_roi",
     "dmp",
     "no_approval",
+    "candidate_only",
+    "gate_only",
+    "fixed_gate",
     "no_area",
     "no_regression",
     "no_boundary",
     "no_revocation",
 )
+
+SPATIAL_METHODS = (
+    "global",
+    "hard_lock",
+    "fixed_roi",
+    "progressive_merge",
+    "entropy_roi",
+    "dmp",
+)
+
+
+def head_context(state, method, head):
+    """Mask review channels independently, retaining p and both prompt channels."""
+    context = state.clone()
+    if (
+        method == "no_approval"
+        or (head == "candidate" and method == "gate_only")
+        or (head == "gate" and method == "candidate_only")
+    ):
+        context[:, 3:7] = 0
+    return context
 
 
 def physical_dilation(mask, radius, spacing):
@@ -70,25 +94,37 @@ class State:
             ]
         ).astype(np.float32)
 
-    def act(self, action, spacing, method="confirmseg"):
-        self.actions += 1
+    def act(self, action, spacing, method="confirmseg", disable_revocation=False):
+        """Charge and apply explicit feedback; conflicts leave review and prompts intact."""
         mask = np.zeros_like(self.labels, dtype=bool)
-        coordinates = np.asarray(action["coordinates"], dtype=int).reshape(-1, 2)
+        supplied_coordinates = np.asarray(action["coordinates"])
+        coordinates = supplied_coordinates.astype(int).reshape(-1, 2)
+        if not np.array_equal(supplied_coordinates, coordinates):
+            raise ValueError("Action coordinates must be integer [row, column] pairs")
+        if not len(coordinates) or len(np.unique(coordinates, axis=0)) != len(
+            coordinates
+        ):
+            raise ValueError("Action coordinates must be nonempty and distinct")
         if np.any(coordinates < 0) or np.any(coordinates >= np.asarray(mask.shape)):
             raise ValueError("Action coordinate outside image")
         mask[coordinates[:, 0], coordinates[:, 1]] = True
         if action["type"] == "revoke":
-            if method == "no_revocation":
+            self.actions += 1
+            if method == "no_revocation" or disable_revocation:
                 return "revocation_disabled", mask
             self.labels[mask] = -1
             self.revoked[mask] = 1
             return "revoke", mask
-        labels = np.asarray(action["labels"], dtype=np.int8)
+        labels = np.asarray(action["labels"])
+        if action["type"] not in ("confirm", "correct"):
+            raise ValueError("Unknown action type")
         if labels.shape != (len(coordinates),) or not np.isin(labels, [0, 1]).all():
             raise ValueError("Each action coordinate needs a binary label")
+        labels = labels.astype(np.int8)
         supplied = np.full(self.labels.shape, -1, dtype=np.int8)
         supplied[coordinates[:, 0], coordinates[:, 1]] = labels
         conflict = mask & (self.labels >= 0) & (supplied != self.labels)
+        self.actions += 1
         if conflict.any():
             return "conflict", conflict
         if action["type"] == "confirm":
@@ -101,13 +137,16 @@ class State:
             if method != "global":
                 self.probability[mask] = supplied[mask]
             return "confirm", mask
-        if action["type"] != "correct":
-            raise ValueError("Unknown action type")
         for label, channel in ((1, self.positive), (0, self.negative)):
             channel[
                 physical_dilation(
                     mask & (supplied == label),
-                    1 if len(coordinates) > 1 else 2,
+                    1
+                    if action.get(
+                        "prompt", "stroke" if len(coordinates) > 1 else "click"
+                    )
+                    == "stroke"
+                    else 2,
                     spacing,
                 )
             ] = 1
@@ -136,53 +175,89 @@ class Editor(nn.Module):
             nn.Conv2d(32, 1, 1),
         )
 
-    def forward(self, features, state, method="confirmseg", candidate=None):
-        context = state.clone()
-        if method == "no_approval":
-            context[:, 3:7] = 0
+    def forward(
+        self,
+        features,
+        state,
+        method="confirmseg",
+        candidate=None,
+        spacing=(1, 1),
+        support=None,
+        radius=16,
+        fixed_gate=0.5,
+        project=True,
+    ):
+        """Apply the same differentiable merge during training and inference."""
+        context = head_context(state, method, "candidate")
         q = (
             self.candidate(features, context).sigmoid()
             if candidate is None
             else candidate
         )
         approved = state[:, 3:5].sum(1, keepdim=True).clamp(0, 1)
-        if method in (
-            "global",
-            "hard_lock",
-            "fixed_roi",
-            "progressive_merge",
-            "entropy_roi",
-            "dmp",
-        ):
-            gate = torch.ones_like(q) if method == "global" else 1 - approved
-            p = (
-                q
-                if method == "global"
-                else torch.where(approved.bool(), state[:, 3:4], q)
+        if method in SPATIAL_METHODS:
+            if method in ("global", "hard_lock", "dmp"):
+                gate = torch.ones_like(q)
+            else:
+                if support is None or len(q) != 1:
+                    raise ValueError(
+                        "Spatial controls require one current prompt support"
+                    )
+                mask = spatial_gate(q, state, support, spacing, method, radius)
+                gate = torch.as_tensor(mask, dtype=q.dtype, device=q.device)[None, None]
+            if method != "global":
+                gate = gate * (1 - approved)
+        elif method == "fixed_gate":
+            gate = (1 - approved) * fixed_gate
+        else:
+            context = head_context(state, method, "gate")
+            inputs = torch.cat(
+                [
+                    features[2],
+                    F.interpolate(
+                        context,
+                        size=features[2].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ),
+                ],
+                1,
             )
-            return p, q, gate
-        inputs = torch.cat(
-            [
-                features[2],
-                F.interpolate(
-                    context,
-                    size=features[2].shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ),
-            ],
-            1,
-        )
-        raw_gate = F.interpolate(
-            self.gate(inputs),
-            size=state.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        ).sigmoid()
-        gate = raw_gate * (1 - approved)
+            raw_gate = F.interpolate(
+                self.gate(inputs),
+                size=state.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).sigmoid()
+            gate = raw_gate * (1 - approved)
         p = state[:, :1] + gate * (q - state[:, :1])
-        p = torch.where(approved.bool(), state[:, 3:4], p)
+        if method != "global" and project:
+            p = torch.where(approved.bool(), state[:, 3:4], p)
         return p, q, gate
+
+
+def spatial_gate(q, state, support, spacing, method, radius):
+    """Hard supports depend on detached masks; gradients pass through the candidate."""
+    candidate = q.detach()[0, 0].cpu().numpy()
+    old = state[0, 0].detach().cpu().numpy()
+    if method == "fixed_roi":
+        return physical_dilation(support, radius, spacing)
+    if method == "progressive_merge":
+        difference, _ = ndi.label((candidate >= 0.5) != (old >= 0.5), np.ones((3, 3)))
+        touched = np.unique(difference[support])
+        return np.isin(difference, touched[touched > 0])
+    entropy = -(
+        candidate * np.log(candidate + 1e-6)
+        + (1 - candidate) * np.log(1 - candidate + 1e-6)
+    )
+    entropy[state[0, 3:5].sum(0).detach().cpu().numpy() > 0] = 0
+    center = np.unravel_index(
+        ndi.gaussian_filter(entropy, np.asarray([radius, radius]) / spacing).argmax(),
+        old.shape,
+    )
+    point = np.zeros(old.shape, dtype=bool)
+    point[center] = True
+    return physical_dilation(point, radius, spacing)
 
 
 def footprint_target(old, truth, approved, support, spacing, radius):
@@ -230,12 +305,15 @@ def loss_terms(p, q, gate, state, truth, target, spacing, weights, method):
     if method not in (
         "confirmseg",
         "no_approval",
+        "candidate_only",
+        "gate_only",
+        "fixed_gate",
         "no_area",
         "no_regression",
         "no_boundary",
         "no_revocation",
     ):
-        return segmentation_loss(q, truth)
+        return base
     return (
         base
         + weights["gate"] * gate_loss
@@ -257,97 +335,73 @@ def infer(
     features=None,
     prompt_support=None,
     band_mm=3,
+    fixed_gate=0.5,
 ):
+    """Decode a correction without labels; timings exclude cached image encoding."""
+
     def sync():
         if str(device).startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device)
 
-    total_start = time.perf_counter()
-    channels = torch.from_numpy(state.channels(spacing, band_mm))[None].to(device)
+    initial.eval()
+    editor.eval()
     if features is None:
         with torch.inference_mode():
             features = initial.encoder(torch.from_numpy(image)[None, None].to(device))
     sync()
+    total_start = time.perf_counter()
+    channels = torch.from_numpy(state.channels(spacing, band_mm))[None].to(device)
+    sync()
     start = time.perf_counter()
     with torch.inference_mode():
-        context = channels.clone()
-        if method == "no_approval":
-            context[:, 3:7] = 0
+        context = head_context(channels, method, "candidate")
         q = editor.candidate(features, context).sigmoid()
         sync()
         candidate_ms = (time.perf_counter() - start) * 1000
         start = time.perf_counter()
-        _, q, gate = editor(features, channels, method, candidate=q)
+        updated, _, _ = editor(
+            features,
+            channels,
+            method,
+            candidate=q,
+            spacing=spacing,
+            support=prompt_support,
+            radius=radius,
+            fixed_gate=fixed_gate,
+            project=False,
+        )
         sync()
-        gate_ms = (time.perf_counter() - start) * 1000
-    start = time.perf_counter()
-    candidate, amplitude = q[0, 0].cpu().numpy(), gate[0, 0].cpu().numpy()
-    old = state.probability
-    support = (
-        prompt_support
-        if prompt_support is not None
-        else (state.positive + state.negative) > 0
-    )
-    if method in ("global", "hard_lock", "dmp"):
-        amplitude = np.ones_like(old)
-    elif method == "fixed_roi":
-        amplitude = physical_dilation(support, radius, spacing).astype(float)
-    elif method == "progressive_merge":
-        difference, _ = ndi.label((candidate >= 0.5) != (old >= 0.5), np.ones((3, 3)))
-        touched = np.unique(difference[support])
-        amplitude = np.isin(difference, touched[touched > 0]).astype(float)
-    elif method == "entropy_roi":
-        entropy = -(
-            candidate * np.log(candidate + 1e-6)
-            + (1 - candidate) * np.log(1 - candidate + 1e-6)
-        )
-        entropy[state.labels >= 0] = 0
-        center = np.unravel_index(
-            ndi.gaussian_filter(
-                entropy, radius / max(float(np.mean(spacing)), 1e-6)
-            ).argmax(),
-            old.shape,
-        )
-        point = np.zeros_like(old, dtype=bool)
-        point[center] = True
-        amplitude = physical_dilation(point, radius, spacing).astype(float)
-    updated = old + amplitude * (candidate - old)
-    merge_ms = (time.perf_counter() - start) * 1000
-    start = time.perf_counter()
-    if method != "global":
-        approved = state.labels >= 0
-        updated[approved] = state.labels[approved]
-    projection_ms = (time.perf_counter() - start) * 1000
-    state.probability = updated.astype(np.float32)
+        gate_merge_ms = (time.perf_counter() - start) * 1000
+        start = time.perf_counter()
+        if method != "global":
+            approved = channels[:, 3:5].sum(1, keepdim=True) > 0
+            updated = torch.where(approved, channels[:, 3:4], updated)
+        sync()
+        projection_ms = (time.perf_counter() - start) * 1000
+    state.probability = updated[0, 0].cpu().numpy().copy()
     state.revoked.fill(0)
+    total_ms = (time.perf_counter() - total_start) * 1000
     return {
         "candidate_ms": candidate_ms,
-        "gate_ms": gate_ms,
-        "candidate_and_gate_ms": candidate_ms + gate_ms,
-        "gate_and_merge_ms": gate_ms + merge_ms,
-        "total_ms": (time.perf_counter() - total_start) * 1000,
+        "gate_and_merge_ms": gate_merge_ms,
+        "total_ms": total_ms,
         "dispatch_ms": max(
-            0.0,
-            (time.perf_counter() - total_start) * 1000
-            - candidate_ms
-            - gate_ms
-            - merge_ms
-            - projection_ms,
+            0.0, total_ms - candidate_ms - gate_merge_ms - projection_ms
         ),
-        "merge_ms": merge_ms,
         "projection_ms": projection_ms,
     }
 
 
-def simulate_action(state, truth, spacing, rng, wrong_rate=0):
+def simulate_action(state, truth, spacing, rng, wrong_rate=0, wrong_mode="event"):
+    """Offline reviewer only: reference labels never enter the learned heads."""
     error = (state.probability >= 0.5) != truth.astype(bool)
-    if state.actions % 3 == 0 and state.reviewed_area < 0.12 * error.size:
+    if (state.actions + 1) % 3 == 0 and state.reviewed_area < 0.12 * error.size:
         edge = max(1, int(np.sqrt(0.009 * error.size)))
         x, y = rng.integers(0, np.maximum(1, np.asarray(error.shape) - edge + 1))
         coordinates = np.argwhere(np.ones((edge, edge), dtype=bool)) + (x, y)
         labels = truth[coordinates[:, 0], coordinates[:, 1]].astype(int)
-        flip = rng.random(len(labels)) < wrong_rate
-        labels[flip] = 1 - labels[flip]
+        flip = rng.random(len(labels) if wrong_mode == "pixel" else 1) < wrong_rate
+        labels = np.where(flip, 1 - labels, labels)
         return {
             "type": "confirm",
             "coordinates": coordinates.tolist(),
