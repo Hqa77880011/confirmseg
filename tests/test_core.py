@@ -290,7 +290,7 @@ class ModelChecks(unittest.TestCase):
     def test_training_and_inference_merge_agree_for_every_method(self):
         from confirmseg.method import METHODS
 
-        torch.set_num_threads(2)
+        torch.set_num_threads(1)
         torch.manual_seed(17)
         initial, editor = InitialModel().eval(), Editor().eval()
         image = np.random.default_rng(17).normal(size=(32, 32)).astype(np.float32)
@@ -328,7 +328,7 @@ class ModelChecks(unittest.TestCase):
                 )
 
     def test_gradients_projection_bound_and_checkpoint_roundtrip(self):
-        torch.set_num_threads(2)
+        torch.set_num_threads(1)
         torch.manual_seed(17)
         initial, editor = InitialModel().eval(), Editor()
         initial.requires_grad_(False)

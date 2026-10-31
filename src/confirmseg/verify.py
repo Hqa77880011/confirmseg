@@ -377,6 +377,9 @@ def verify(output, device="cpu"):
         ],
     )
     save(output / "verification.json", verification)
+    from .verify_review import verify as verify_review
+
+    verify_review(output, output / "review_protocol")
     print(f"Functional checks passed; retained outputs: {output}", flush=True)
 
 

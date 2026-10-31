@@ -392,21 +392,20 @@ def infer(
     }
 
 
-def simulate_action(state, truth, spacing, rng, wrong_rate=0, wrong_mode="event"):
+def simulate_action(state, truth, spacing, rng, wrong_rate=0, wrong_mode="event",
+                    review_action=None, subpatch_fraction=.25, subpatch_max_pixels=0):
     """Offline reviewer only: reference labels never enter the learned heads."""
     error = (state.probability >= 0.5) != truth.astype(bool)
     if (state.actions + 1) % 3 == 0 and state.reviewed_area < 0.12 * error.size:
+        if review_action is not None:
+            return review_action
+        from .review import corrupt_review
+
         edge = max(1, int(np.sqrt(0.009 * error.size)))
         x, y = rng.integers(0, np.maximum(1, np.asarray(error.shape) - edge + 1))
         coordinates = np.argwhere(np.ones((edge, edge), dtype=bool)) + (x, y)
-        labels = truth[coordinates[:, 0], coordinates[:, 1]].astype(int)
-        flip = rng.random(len(labels) if wrong_mode == "pixel" else 1) < wrong_rate
-        labels = np.where(flip, 1 - labels, labels)
-        return {
-            "type": "confirm",
-            "coordinates": coordinates.tolist(),
-            "labels": labels.tolist(),
-        }
+        return corrupt_review(coordinates, truth, rng, wrong_rate, wrong_mode,
+                              subpatch_fraction, subpatch_max_pixels)
     components, number = ndi.label(error, np.ones((3, 3)))
     if number:
         sizes = np.bincount(components.ravel())

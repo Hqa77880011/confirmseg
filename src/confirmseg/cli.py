@@ -42,6 +42,7 @@ from .metrics import (
     transition,
 )
 from .network import segmentation_loss
+from .review import MODES, SUBPATCH_PROTOCOL, make_plan, validate_plan
 from .utils import load, peak_memory_mib, plot_results, save, seed_all
 
 
@@ -292,7 +293,7 @@ def snapshot(state, truth, spacing, rework, update=None):
     return values
 
 
-def episode(row, reader, initial, editor, cfg, args, replay=None):
+def episode(row, reader, initial, editor, cfg, args, replay=None, reviews=None):
     """Offline simulation uses labels for feedback/scoring, never as network inputs."""
     image, masks, spacing = fixed_field(row, initial=reader, size=cfg["size"])
     truth = masks[reader]
@@ -310,6 +311,13 @@ def episode(row, reader, initial, editor, cfg, args, replay=None):
     state = State.initial(probability, localization)
     initial_dice = overlap(counts(probability, truth))[0]
     rng = np.random.default_rng(args.policy_seed)
+    key = row["id"] + "_" + str(reader)
+    if reviews is None and args.wrong_mode == "subpatch" and replay is None:
+        reviews = make_plan(truth, key, args.policy_seed, cfg["budget"],
+                            args.wrong_approval, args.wrong_mode,
+                            getattr(args, "wrong_subpatch_fraction", .25),
+                            getattr(args, "wrong_subpatch_max_pixels", 0))
+    review_index = 0
     snapshots, actions, repaired, pending = [], [], [], []
     rework = 0
     snapshots.append(snapshot(state, truth, spacing, rework))
@@ -323,14 +331,27 @@ def episode(row, reader, initial, editor, cfg, args, replay=None):
             action = pending.pop(0)
         else:
             action = simulate_action(
-                state, truth, spacing, rng, args.wrong_approval, args.wrong_mode
+                state, truth, spacing, rng, args.wrong_approval, args.wrong_mode,
+                reviews[review_index] if reviews is not None else None,
+                getattr(args, "wrong_subpatch_fraction", .25),
+                getattr(args, "wrong_subpatch_max_pixels", 0),
             )
+            if action["type"] == "confirm":
+                action.setdefault("review", {})["event_index"] = review_index
+                review_index += 1
         actions.append(action)
         disable_revocation = (
             getattr(args, "disable_revocation", False) or args.method == "no_revocation"
         )
         verdict, support = state.act(action, spacing, args.method, disable_revocation)
         update = {"verdict": verdict}
+        if action["type"] == "confirm":
+            coordinates = np.asarray(action["coordinates"], dtype=int)
+            wrong = np.asarray(action["labels"]) != truth[tuple(coordinates.T)]
+            update["review_event"] = {
+                "event_index": action.get("review", {}).get("event_index", len(actions)),
+                "review_pixels": len(coordinates), "wrong_pixels": int(wrong.sum()),
+            }
         if verdict == "conflict" and not disable_revocation and replay is None:
             pending = [
                 {"type": "revoke", "coordinates": np.argwhere(support).tolist()},
@@ -392,6 +413,16 @@ def run(args):
         raise ValueError("--seed must match the correction checkpoint")
     initial, editor = load_models(args.initial, args.checkpoint, args.device)
     replay = None
+    condition = review_condition(args)
+    plans = None
+    if args.review_plan:
+        bundle = load(args.review_plan)
+        if bundle["size"] != cfg["size"] or bundle["budget"] != cfg["budget"]:
+            raise ValueError("Review plan must use the same grid and charged budget")
+        if bundle["policy_seed"] != args.policy_seed or bundle["protocol"] != args.protocol:
+            raise ValueError("Review plan must use the same policy seed and task protocol")
+        condition = bundle["condition"]
+        plans = bundle["tasks"]
     if args.replay:
         archived = load(args.replay)
         if (
@@ -402,6 +433,10 @@ def run(args):
         replay = {
             r["id"] + "_" + str(r["reader"]): r["actions"] for r in archived["episodes"]
         }
+        if archived["policy_seed"] != args.policy_seed:
+            raise ValueError("Replay must use the source feedback-policy seed")
+        condition = {key: value for key, value in archived.get("condition", {}).items()
+                     if key not in ("replay", "disable_revocation", "stratum", "protocol")}
     episodes = []
     output = Path(args.output)
     tasks = evaluation_tasks(
@@ -411,6 +446,13 @@ def run(args):
         key = row["id"] + "_" + str(reader)
         if replay is not None and key not in replay:
             raise ValueError(f"Missing task in fixed replay: {key}")
+        reviews = None
+        if plans is not None:
+            if key not in plans or len(plans[key]) < cfg["budget"] - 1:
+                raise ValueError(f"Missing or incomplete review plan: {key}")
+            _, masks, _ = fixed_field(row, initial=reader, size=cfg["size"])
+            reviews = plans[key]
+            validate_plan(reviews, masks[reader], condition)
         result, image, truth, prediction = episode(
             row,
             reader,
@@ -419,6 +461,7 @@ def run(args):
             cfg,
             args,
             replay[key] if replay is not None else None,
+            reviews,
         )
         if args.stratum:
             bounds = {
@@ -486,8 +529,7 @@ def run(args):
             "seed": args.seed,
             "policy_seed": args.policy_seed,
             "condition": {
-                "wrong_approval": args.wrong_approval,
-                "wrong_mode": args.wrong_mode,
+                **condition,
                 "stratum": args.stratum,
                 "replay": bool(args.replay),
                 "protocol": args.protocol,
@@ -497,6 +539,35 @@ def run(args):
         },
     )
     save(output / "curves.json", {"summary": curves, "purpose": episodes[0]["purpose"]})
+
+
+def review_condition(args):
+    """Describe the chosen intervention, separately from adaptive model responses."""
+    return {"wrong_approval": args.wrong_approval, "wrong_mode": args.wrong_mode,
+            "wrong_subpatch_fraction": args.wrong_subpatch_fraction,
+            "wrong_subpatch_max_pixels": args.wrong_subpatch_max_pixels,
+            "review_protocol": SUBPATCH_PROTOCOL if args.wrong_mode == "subpatch" else args.wrong_mode,
+            "implementation_origin": "current_explicit_choice"}
+
+
+def review_plan(args):
+    """Create model-independent shared review proposals from offline annotations."""
+    cfg = load(args.config)
+    tasks = {}
+    condition = review_condition(args)
+    for row, reader in evaluation_tasks(records(args.manifest, args.split), args.protocol, args.policy_seed):
+        _, masks, _ = fixed_field(row, initial=reader, size=cfg["size"])
+        key = row["id"] + "_" + str(reader)
+        tasks[key] = make_plan(masks[reader], key, args.policy_seed, cfg["budget"],
+                               args.wrong_approval, args.wrong_mode,
+                               args.wrong_subpatch_fraction, args.wrong_subpatch_max_pixels)
+        validate_plan(tasks[key], masks[reader], condition)
+    if not tasks:
+        raise ValueError("No eligible tasks for the review plan")
+    save(args.output, {"schema": "confirmseg-review-v1", "size": cfg["size"],
+                       "budget": cfg["budget"], "condition": condition,
+                       "policy_seed": args.policy_seed, "protocol": args.protocol,
+                       "tasks": tasks})
 
 
 def evaluate(args):
@@ -820,10 +891,21 @@ def argument_parser():
     execution.add_argument("--manifest", required=True)
     execution.add_argument("--split", choices=["validation", "test"], default="test")
     execution.add_argument("--policy-seed", type=int, default=31415)
-    execution.add_argument("--wrong-approval", type=float, default=0)
-    execution.add_argument("--wrong-mode", choices=["event", "pixel"], default="event")
+    plan = commands.add_parser("review-plan", help="freeze offline review geometry and errors")
+    plan.add_argument("--manifest", required=True)
+    plan.add_argument("--split", choices=["validation", "test"], default="test")
+    plan.add_argument("--policy-seed", type=int, default=31415)
+    plan.add_argument("--protocol", choices=["patient", "all"], default="patient")
+    plan.add_argument("--config", default="configs/default.json")
+    plan.add_argument("--output", required=True)
+    for item in (execution, plan):
+        item.add_argument("--wrong-approval", type=float, default=0)
+        item.add_argument("--wrong-mode", choices=MODES, default="subpatch" if item is plan else "event")
+        item.add_argument("--wrong-subpatch-fraction", type=float, default=.25)
+        item.add_argument("--wrong-subpatch-max-pixels", type=int, default=0)
     execution.add_argument("--disable-revocation", action="store_true")
     execution.add_argument("--replay")
+    execution.add_argument("--review-plan")
     execution.add_argument("--stratum", choices=["low", "middle", "high"])
     execution.add_argument("--protocol", choices=["patient", "all"], default="patient")
     execution.add_argument("--overlays", type=int, default=3)
@@ -871,10 +953,17 @@ def main(argv=None):
             prepare_acdc(args.input, args.output, args.split_seed)
         else:
             prepare_manifest(args.input, args.output, args.split_seed)
-    elif args.command == "run":
+    elif args.command in ("run", "review-plan"):
         if not 0 <= args.wrong_approval <= 1:
             parser.error("--wrong-approval must be in [0,1]")
-        if args.replay and args.wrong_approval:
+        if not 0 < args.wrong_subpatch_fraction <= 1 or args.wrong_subpatch_max_pixels < 0:
+            parser.error("Sub-patch fraction must be in (0,1], max pixels nonnegative")
+        if args.command == "review-plan":
+            review_plan(args)
+            return
+        if args.replay and args.review_plan:
+            parser.error("Choose one frozen review plan or one full action replay")
+        if (args.replay or args.review_plan) and args.wrong_approval:
             parser.error(
                 "Wrong approvals must be recorded in the source replay, not reinjected"
             )

@@ -210,6 +210,9 @@ def summarize(episodes, method):
         denominator = sum(r["band_regression"][name][1] for r in snapshots)
         result["band_counts"][name] = [numerator, denominator]
         result["regression_" + name + "_percent"] = percent(numerator, denominator)
+    from .review import statistics
+
+    result.update(statistics(episodes))
     return result
 
 

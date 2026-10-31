@@ -198,9 +198,22 @@ confirmseg run --manifest data/acdc/manifest.json --initial checkpoints/acdc/s17
 
 Checkpoint configuration carries the full inference budget; replay requires the same grid, budget and complete task set. Fixed replay measures responses to identical supplied actions; adaptive trajectories supply rework/cost comparisons.
 
-For wrong-approval interventions, add --wrong-approval 0.05 or 0.10. Default --wrong-mode event reverses an entire selected review patch's labels with that probability; --wrong-mode pixel flips individual reviewed pixels. The --disable-revocation option applies the no-revocation intervention to any baseline, including progressive_merge. Initial-quality filtering uses --stratum low [0.65,0.75), middle [0.75,0.85), or high [0.85,0.95), with natural held-out initial predictions.
+Wrong-approval interventions accept --wrong-approval 0.05 or 0.10. The explicit --wrong-mode subpatch protocol samples one Bernoulli trial per review event, chooses a uniformly sampled reviewed pixel, and flips a single 8-connected sub-patch with the anchor's original class. Deterministic breadth-first growth stops at ceil(--wrong-subpatch-fraction × review area), additionally bounded by --wrong-subpatch-max-pixels when positive, or at exhaustion of that same-class connected component. The defaults are fraction 0.25 and no additional pixel cap. A review still inspects and charges its entire square patch: side floor(sqrt(0.009 × ROI pixels)), limited by the existing 1% per-review / 12% cumulative caps. Repeated accepted reviews charge their area again.
 
-The historical wrong-approval table used an event-wise sub-patch protocol whose exact sub-patch construction is not recorded locally. The current event option treats the complete supplied review patch as one event; the pixel option is a separate intervention. Neither option establishes reproduction of that historical table. E01–E04 use correct approvals and are unaffected by this distinction.
+Freeze review geometry, event choices and erroneous labels before comparing methods:
+
+~~~bash
+confirmseg review-plan --manifest data/acdc/manifest.json --config configs/default.json --policy-seed 31415 --wrong-approval 0.10 --wrong-mode subpatch --wrong-subpatch-fraction 0.25 --output runs/acdc/wrong10_plan.json
+confirmseg run --manifest data/acdc/manifest.json --initial checkpoints/acdc/s17/initial/best.pt --checkpoint checkpoints/acdc/s17/hard_lock/best.pt --method hard_lock --review-plan runs/acdc/wrong10_plan.json --output runs/acdc/wrong10_neutral
+confirmseg run --manifest data/acdc/manifest.json --initial checkpoints/acdc/s17/initial/best.pt --checkpoint checkpoints/acdc/s17/confirmseg/best.pt --method confirmseg --replay runs/acdc/wrong10_neutral/results.json --output runs/acdc/wrong10_confirmseg_replay
+confirmseg run --manifest data/acdc/manifest.json --initial checkpoints/acdc/s17/initial/best.pt --checkpoint checkpoints/acdc/s17/progressive_merge/best.pt --method progressive_merge --replay runs/acdc/wrong10_neutral/results.json --output runs/acdc/wrong10_pm_replay
+~~~
+
+Use the same config grid/budget, task protocol and policy seed for the plan and runs. Geometry and corruption use separate per-task/per-event random streams; changing the error rate preserves review geometry. A shared plan freezes the ordered review proposals for adaptive runs, which can consume different prefixes when conflicts use charged actions. Full neutral replay freezes every realized supplied action and wrong-label set. Replay inherits its source intervention metadata. The --disable-revocation option applies the intervention to any baseline, including progressive_merge; the model receives only supplied labels and the existing seven state channels, never the corruption flags or ground truth. Only explicit user-supplied opposite labels cause conflicts. A conflict, explicit revocation and retried correction are separate charged actions. Initial-quality filtering uses --stratum low [0.65,0.75), middle [0.75,0.85), or high [0.85,0.95).
+
+Outputs retain per-event audit metadata and report review attempts, distinct proposed/accepted/wrong events, accepted reviewed/wrong pixel counts, wrong-event percentage and accepted wrong-pixel percentage with their own denominators. Conflict retries retain the event index and do not create another sampled event. The audit uses reference labels only in offline simulation/scoring. Standalone predict still consumes image, localization and explicit actions without a reference mask.
+
+Legacy --wrong-mode event reverses a complete selected review patch, while --wrong-mode pixel independently flips reviewed pixels. The default run mode remains event for compatibility; use subpatch explicitly or supply a review plan. The historical table specifies event-wise selection of one same-class sub-patch, but its exact shape/anchor/area and original trajectories were not preserved in the available source archive, five local Git commits or aggregate result files; the historical original idea-pack path is absent. homogeneous_connected_bfs_v1 is this release's declared implementation choice, and can now be run and checked. Its new results are not a reconstruction of that historical table. E01–E04 use correct approvals.
 
 ## Cached-feature timing
 
@@ -225,6 +238,7 @@ Batch-one timing excludes image encoding, synchronizes CUDA, and reports candida
 | RA01 budget summaries | metrics.budget_integral | evaluate |
 | Overlays, curves, comparisons, paired intervals | utils.plot_results | plot |
 | Cached-feature stages, parameters, memory | cli.benchmark | benchmark |
+| Event-wise same-class sub-patch and shared intervention | review.py | review-plan; run --review-plan / --wrong-mode subpatch |
 
 ## Outputs and verification
 
@@ -233,9 +247,12 @@ Training produces validation-selected best.pt and history.json. Checkpoints reta
 ~~~bash
 python -m unittest discover -s tests -v
 python -m confirmseg.verify --output runs/smoke --device cpu
+python -m confirmseg.verify_review --fixture runs/smoke --output runs/review-smoke
 ~~~
 
-The verify command creates a synthetic 32×32 fixture, exercises NIfTI/NPZ preparation, one initial fit and five one-epoch correction fits (two training cases each), all method forward/loss/backward paths, checkpoint reload, neutral replay, aggregation, plots, explicit label-free actions and a short timing check. It retains inspectable outputs under the chosen directory. These data and outputs are functional checks, not paper experiments.
+The verify command creates a synthetic 32×32 fixture, exercises NIfTI/NPZ preparation, one initial fit and six one-epoch correction fits (two training cases each, including PM), all method forward/loss/backward paths, checkpoint reload, neutral replay, aggregation, plots, explicit label-free actions and a short timing check. It also runs the shared sub-patch plan, two trained-editor replays, the PM no-revocation option, paired evaluation and independent pixel/event denominator checks. verify_review can repeat that last portion using the retained short-fit checkpoints. CPU checks use one thread. These data and outputs are functional checks, not paper experiments.
+
+The 2026-11-01 CPU run passed all 18 unit checks and the complete fresh functional pipeline. Its stress fixture uses error probability 1, two test episodes and six charged actions per episode: four selected/accepted wrong review events, eight wrong pixels among 36 accepted reviewed pixels (100% wrong events; 22.222222% wrong pixels). These are deliberately distinct denominators. ConfirmSeg/PM replays use identical complete action lists and preserve the declared intervention. All seven short-fit losses are finite, and checkpoint output errors are zero. Retained local checks are under runs/batch01-review-e2e; CI reruns the same fresh pipeline.
 
 Validated on Windows, Python 3.13.5, PyTorch 2.7.1+cu118, NumPy 2.1.3 (OpenBLAS), SciPy 1.15.3, Matplotlib 3.10.0 and nibabel 5.4.2. Numerical checks cover hand-computed losses/metrics, patient pairing, first-hit area, both learned heads' gradients/parameter updates and output-preserving checkpoint reload. CUDA interaction/timing was also exercised on an RTX 4060 Laptop GPU. Full medical-data training, real LIDC DICOM preparation and the paper's reported scores were not rerun; trained checkpoints and medical data are not bundled.
 
