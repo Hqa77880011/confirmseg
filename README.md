@@ -200,6 +200,8 @@ Checkpoint configuration carries the full inference budget; replay requires the 
 
 For wrong-approval interventions, add --wrong-approval 0.05 or 0.10. Default --wrong-mode event reverses an entire selected review patch's labels with that probability; --wrong-mode pixel flips individual reviewed pixels. The --disable-revocation option applies the no-revocation intervention to any baseline, including progressive_merge. Initial-quality filtering uses --stratum low [0.65,0.75), middle [0.75,0.85), or high [0.85,0.95), with natural held-out initial predictions.
 
+The historical wrong-approval table used an event-wise sub-patch protocol whose exact sub-patch construction is not recorded locally. The current event option treats the complete supplied review patch as one event; the pixel option is a separate intervention. Neither option establishes reproduction of that historical table. E01–E04 use correct approvals and are unaffected by this distinction.
+
 ## Cached-feature timing
 
 ~~~bash

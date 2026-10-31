@@ -21,7 +21,7 @@ def verify(output, device="cpu"):
 
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    torch.set_num_threads(2)
+    torch.set_num_threads(1)
     seed_all(17)
     rng = np.random.default_rng(17)
     raw = output / "raw"

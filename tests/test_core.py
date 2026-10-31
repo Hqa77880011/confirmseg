@@ -19,6 +19,7 @@ from confirmseg.method import (
     loss_terms,
     infer,
     physical_dilation,
+    simulate_action,
 )
 from confirmseg.metrics import (
     assd,
@@ -54,6 +55,26 @@ def metric_episode(patient="p", identifier="task", tp=9, fn=2, rework=0):
 
 
 class ProtocolChecks(unittest.TestCase):
+    def test_event_and_pixel_wrong_approval_are_distinct(self):
+        class ReviewRng:
+            def integers(self, low, high):
+                return np.zeros(2, dtype=int)
+
+            def random(self, size):
+                return np.resize([0.25, 0.75], size)
+
+        state = State.initial(np.full((64, 64), 0.25))
+        state.actions = 2
+        truth = np.indices((64, 64)).sum(axis=0) % 2
+        event = simulate_action(state, truth, (1, 1), ReviewRng(), 0.5, "event")
+        pixel = simulate_action(state, truth, (1, 1), ReviewRng(), 0.5, "pixel")
+        coordinates = np.asarray(event["coordinates"])
+        supplied_truth = truth[coordinates[:, 0], coordinates[:, 1]]
+        np.testing.assert_array_equal(event["labels"], 1 - supplied_truth)
+        flips = np.asarray(pixel["labels"]) != supplied_truth
+        self.assertTrue(flips.any())
+        self.assertFalse(flips.all())
+
     def test_console_success_does_not_return_a_model(self):
         from confirmseg.cli import main
 
